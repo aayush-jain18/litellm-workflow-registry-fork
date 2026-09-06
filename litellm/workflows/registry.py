@@ -1,14 +1,16 @@
 import json
 import os
-import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import yaml
 
 from jsonschema import validate as jsonschema_validate, ValidationError
 
+from .backends.git_registry import GitRegistry
+
 SCHEMA_PATH = Path(__file__).with_name("schema.json")
 DEFAULT_STORE = Path(os.environ.get("LITELLM_WORKFLOW_STORE", Path.home() / ".litellm" / "workflows"))
+DEFAULT_BACKEND = os.environ.get("LITELLM_WORKFLOW_BACKEND", "git")
 
 class WorkflowValidationError(Exception):
     pass
@@ -19,12 +21,9 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-._" else "_" for c in name)
 
 
-class WorkflowRegistry:
+class FilesystemRegistry:
     """
-    A filesystem-backed workflow registry adapted to litellm conventions.
-    - Store layout: <store_dir>/<tenant_id or _global>/<workflow_name>.yaml
-    - Validate against JSON Schema and perform minimal semantic checks.
-    - Publish a config-sync event so replicas can reload (best-effort).
+    Legacy simple filesystem registry kept for compatibility.
     """
     def __init__(self, store_dir: Optional[Path] = None):
         self.store_dir = Path(store_dir or DEFAULT_STORE)
@@ -66,15 +65,11 @@ class WorkflowRegistry:
             if ntype == "skill":
                 if not node.get("skill"):
                     raise WorkflowValidationError(f"node '{name}' of type 'skill' must have a 'skill' field")
-                # basic format check: provider.skill@version or package-like
-                # do not attempt to validate provider existence here to avoid heavy coupling
                 if "@" in node.get("skill") and node.get("skill").count("@") > 1:
                     raise WorkflowValidationError(f"node '{name}' skill field has invalid format: {node.get('skill')}")
             if ntype == "mcp":
                 if not node.get("mcp_server") or not node.get("mcp_tool"):
                     raise WorkflowValidationError(f"node '{name}' of type 'mcp' must have 'mcp_server' and 'mcp_tool' fields")
-        # optional: detect simple cycles (not exhaustive)
-        # For now, skip complex cycle detection; orchestrator will handle more strict checks.
 
     def validate(self, workflow_obj: Dict[str, Any]) -> None:
         self.validate_syntax(workflow_obj)
@@ -87,9 +82,9 @@ class WorkflowRegistry:
         except Exception:
             return
         try:
+            import asyncio
             loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # no running loop; run briefly
+        except Exception:
             try:
                 asyncio.run(publish_config_change_for_object_type(object_type))
             except Exception:
@@ -104,16 +99,15 @@ class WorkflowRegistry:
         wf = yaml.safe_load(yaml_text)
         if not isinstance(wf, dict):
             raise WorkflowValidationError("workflow YAML must be a mapping/object")
-        # Enforce tenant_id available either as arg or in YAML
+        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+            self.schema = json.load(f)
         tid = tenant_id or wf.get("tenant_id")
         if tid is None:
             raise WorkflowValidationError("tenant_id must be provided either in YAML or as an argument")
-        # Ensure metadata block
         if "metadata" not in wf:
             wf["metadata"] = {}
         if "created_at" not in wf["metadata"]:
             from datetime import datetime
-
             wf["metadata"]["created_at"] = datetime.utcnow().isoformat() + "Z"
         self.validate(wf)
         name = wf.get("name")
@@ -122,9 +116,7 @@ class WorkflowRegistry:
         p = self._tenant_dir(tid) / f"{_safe_name(name)}.yaml"
         if p.exists() and not overwrite:
             raise FileExistsError(f"{p} exists; pass overwrite=True to replace")
-        # write canonical YAML (preserve order)
         p.write_text(yaml.safe_dump(wf, sort_keys=False), encoding="utf-8")
-        # publish config change so proxies/resync subscribers notice
         try:
             self._publish_config_change()
         except Exception:
@@ -151,3 +143,60 @@ class WorkflowRegistry:
                 pass
         else:
             raise FileNotFoundError(f"{p} not found")
+
+
+class WorkflowRegistry:
+    """
+    Frontend registry that selects an implementation based on environment.
+    """
+
+    def __init__(self, store_dir: Optional[Path] = None):
+        self.store_dir = Path(store_dir or DEFAULT_STORE)
+        backend = DEFAULT_BACKEND.lower()
+        if backend == "git":
+            # initialize a git repo at store_dir if needed
+            self.backend = GitRegistry(self.store_dir)
+        else:
+            self.backend = FilesystemRegistry(self.store_dir)
+        # load schema
+        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+            self.schema = json.load(f)
+
+    def validate(self, workflow_obj: Dict[str, Any]) -> None:
+        try:
+            jsonschema_validate(instance=workflow_obj, schema=self.schema)
+        except ValidationError as e:
+            raise WorkflowValidationError(str(e))
+        # semantic checks delegated to backend when registering
+
+    def register_yaml(self, yaml_text: str, tenant_id: Optional[str] = None, overwrite: bool = False, author: Optional[str] = None) -> Any:
+        wf = yaml.safe_load(yaml_text)
+        if not isinstance(wf, dict):
+            raise WorkflowValidationError("workflow YAML must be a mapping/object")
+        tid = tenant_id or wf.get("tenant_id")
+        if tid is None:
+            raise WorkflowValidationError("tenant_id must be provided either in YAML or as an argument")
+        # minimal semantic validation here
+        entry = wf.get("entry")
+        nodes = wf.get("nodes", {})
+        if entry not in nodes:
+            raise WorkflowValidationError(f"entry '{entry}' not found in nodes")
+        # delegate to backend
+        if hasattr(self.backend, "register_yaml"):
+            if isinstance(self.backend, GitRegistry):
+                return self.backend.register_yaml(yaml_text=yaml_text, tenant_id=tid, overwrite=overwrite, author=author)
+            return self.backend.register_yaml(yaml_text=yaml_text, tenant_id=tid, overwrite=overwrite)
+        raise NotImplementedError("backend does not support register_yaml")
+
+    def list(self, tenant_id: Optional[str] = None) -> List[str]:
+        return self.backend.list(tenant_id)
+
+    def get(self, name: str, tenant_id: Optional[str] = None, version: Optional[str] = None) -> Dict[str, Any]:
+        if isinstance(self.backend, GitRegistry):
+            return self.backend.get(name=name, tenant_id=tenant_id or "_global", version=version)
+        return self.backend.get(name=name, tenant_id=tenant_id)
+
+    def delete(self, name: str, tenant_id: Optional[str] = None, version: Optional[str] = None, author: Optional[str] = None) -> Any:
+        if isinstance(self.backend, GitRegistry):
+            return self.backend.delete(name=name, tenant_id=tenant_id or "_global", version=version, author=author)
+        return self.backend.delete(name=name, tenant_id=tenant_id)
