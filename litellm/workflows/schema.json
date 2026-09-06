@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Litellm Workflow",
+  "type": "object",
+  "required": ["kind", "name", "version", "entry", "nodes"],
+  "properties": {
+    "kind": { "type": "string" },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "schema_version": { "type": "string" },
+    "topology": { "type": "string" },
+    "tenant_id": { "type": "string" },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "created_at": { "type": "string", "format": "date-time" },
+        "created_by": { "type": "string" },
+        "description": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "published": { "type": "boolean" },
+        "object_permission": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": { "enum": ["required", "optional", "default_enabled", "default_disabled"] }
+    },
+    "gating": {
+      "type": "object",
+      "additionalProperties": { "enum": ["required", "default_enabled", "default_disabled"] }
+    },
+    "durability": { "type": "object" },
+    "entry": { "type": "string" },
+    "nodes": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "skill": { "type": "string" },
+          "mcp_server": { "type": "string" },
+          "mcp_tool": { "type": "string" },
+          "for_each": { "type": "string" },
+          "continue_on_error": { "type": "boolean" },
+          "on_success": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+          "on_failure": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+          "join": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] }
+        },
+        "required": ["type"],
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}
